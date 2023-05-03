@@ -18,16 +18,24 @@ class AdaBound(Optimizer):
             numerical stability (default: 1e-8)
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         amsbound (boolean, optional): whether to use the AMSBound variant of this algorithm
+        theta (float, optional): standard deviation used for initialization of normally
+            distributed tensor, which values are then used as a replacers for 'nan'
+            and 'inf' values to fix numerical instability on low precisions (like float16)
+            (default: 1e-5)
+        nanfix (boolean, optional): whether to use the nan/inf correction. Slightly decrease
+            performance.
     .. Adaptive Gradient Methods with Dynamic Bound of Learning Rate:
         https://openreview.net/forum?id=Bkg3g2R9FX
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), final_lr=0.1, gamma=1e-3,
-                 eps=1e-8, weight_decay=0, amsbound=False):
+                 eps=1e-8, weight_decay=0, amsbound=False, theta=1e-5, nanfix=False):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= eps:
             raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= theta:
+            raise ValueError("Invalid theta value: {}".format(theta))
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         if not 0.0 <= betas[1] < 1.0:
@@ -37,7 +45,7 @@ class AdaBound(Optimizer):
         if not 0.0 <= gamma < 1.0:
             raise ValueError("Invalid gamma parameter: {}".format(gamma))
         defaults = dict(lr=lr, betas=betas, final_lr=final_lr, gamma=gamma, eps=eps,
-                        weight_decay=weight_decay, amsbound=amsbound)
+                        weight_decay=weight_decay, amsbound=amsbound, theta=theta, nanfix=nanfix)
         super(AdaBound, self).__init__(params, defaults)
 
         self.base_lrs = list(map(lambda group: group['lr'], self.param_groups))
@@ -46,6 +54,12 @@ class AdaBound(Optimizer):
         super(AdaBound, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault('amsbound', False)
+
+    def _nanfix(self, t, s):
+        t[torch.isnan(t)] = s[torch.isnan(t)]
+        t[torch.isneginf(t)] = torch.finfo(t.dtype).min
+        t[torch.isposinf(t)] = torch.finfo(t.dtype).max
+        return t
 
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -89,10 +103,17 @@ class AdaBound(Optimizer):
 
                 if group['weight_decay'] != 0:
                     grad = grad.add(group['weight_decay'], p.data)
-
-                # Decay the first and second moment running average coefficient
+                
+                # Correct invalid values.
+                # There is no in-place 'where' (since 2019): https://github.com/pytorch/pytorch/issues/28329
+                # In otherwise it would looks much prettier.
+                if group['nanfix']:
+                  low_p_fix = torch.nn.init.normal_(torch.zeros_like(p.data), std=group['theta'])
+                  self._nanfix(grad, low_p_fix)
+                
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
                 if amsbound:
                     # Maintains the maximum of all 2nd moment running avg. till now
                     torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
@@ -100,7 +121,7 @@ class AdaBound(Optimizer):
                     denom = max_exp_avg_sq.sqrt().add_(group['eps'])
                 else:
                     denom = exp_avg_sq.sqrt().add_(group['eps'])
-
+                
                 bias_correction1 = 1 - beta1 ** state['step']
                 bias_correction2 = 1 - beta2 ** state['step']
                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
