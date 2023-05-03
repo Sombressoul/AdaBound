@@ -107,7 +107,7 @@ class AdaBound(Optimizer):
                 # Correct invalid values.
                 # There is no in-place 'where' (since 2019): https://github.com/pytorch/pytorch/issues/28329
                 # In otherwise it would looks much prettier.
-                if group['nanfix']:
+                if group['nanfix'] and torch.isnan(grad).add(torch.isposinf(grad)).add(torch.isneginf(grad)).sum().item() > 0:
                   low_p_fix = torch.nn.init.normal_(torch.zeros_like(p.data), std=group['theta'])
                   self._nanfix(grad, low_p_fix)
                 
